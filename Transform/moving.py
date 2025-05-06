@@ -71,105 +71,106 @@ for window_duration, window_name in WINDOWS:
             F.col("std_price")
         )
     agg_streams.append(windowed_agg)
+# --- Restructured approach ---
+# Calculate stats per window first
+stats_dfs = []
+for window_duration, window_name in WINDOWS:
+    stats_df = watermarked_stream.groupBy(
+            F.window("event_timestamp", window_duration).alias("time_window"),
+            "symbol"
+        ).agg(
+            # Calculate aggregates
+            F.avg("price").alias("avg_price"),
+            F.stddev_pop("price").alias("std_price")
+        ).select(
+           # Select necessary fields including start/end times
+           F.col("time_window.start").alias("w_start"),
+           F.col("time_window.end").alias("w_end"),
+           "symbol",
+           # Create struct WITH aggregate values
+           F.struct(
+               F.lit(window_name).alias("window"),
+               # --- INCLUDE AGGREGATES IN STRUCT ---
+               F.col("avg_price"),
+               # Handle null/NaN stddev (important!)
+               F.when(F.isnull(F.col("std_price")) | F.isnan(F.col("std_price")), 0.0)
+                .otherwise(F.col("std_price")).alias("std_price")
+               # --- END INCLUDE ---
+           ).alias("stat_data") # Rename the struct
+       )
+    stats_dfs.append(stats_df) # Add DF for this window duration to the list
 
 # --- Combine Results from All Windows ---
-# Union all aggregated streams - might be less efficient than other methods
-# but conceptually simpler for distinct window calculations.
-# Note: UnionByName requires Spark 3.1+
-# For older Spark, ensure schemas match exactly and use union()
-if len(agg_streams) > 1:
-     # This union approach doesn't work well directly on multiple streaming DFs.
-     # Alternative: Calculate all aggregates in one go if possible, or process separately.
-     # Let's restructure to calculate stats and then group them.
+final_combined_stream = None
+# Need to union the calculated DFs (stats_dfs)
+if stats_dfs: # Check if the list is not empty
+    # Use reduce and unionByName for robustness if Spark version allows (3.1+)
+    # Requires: from functools import reduce
+    # from pyspark.sql import DataFrame
+    # final_combined_stream = reduce(DataFrame.unionByName, stats_dfs)
 
-     # Calculate stats per window first
-     stats_dfs = []
-     for window_duration, window_name in WINDOWS:
-         stats_df = watermarked_stream.groupBy(
-                 F.window("event_timestamp", window_duration).alias("time_window"),
-                 "symbol"
-             ).agg(
-                 F.avg("price").alias("avg_price"),
-                 F.stddev_pop("price").alias("std_price")
-             ).select(
-                 F.col("time_window.end").alias("timestamp"), # Representative timestamp
-                 "symbol",
-                 F.struct(
-                     F.lit(window_name).alias("window"),
-                     F.col("avg_price"),
-                     F.when(F.isnull(F.col("std_price")) | F.isnan(F.col("std_price")), 0.0).otherwise(F.col("std_price")).alias("std_price") # Handle null/NaN stddev
-                 ).alias("stat_data")
-             )
-         stats_dfs.append(stats_df)
+    # Simpler union loop for broader compatibility (requires exact schema match)
+    # The schema should be (w_start, w_end, symbol, stat_data) - check this
+    final_combined_stream = stats_dfs[0]
+    for i in range(1, len(stats_dfs)):
+        # Ensure schemas match before union if not using unionByName
+        # final_combined_stream.printSchema()
+        # stats_dfs[i].printSchema()
+        final_combined_stream = final_combined_stream.union(stats_dfs[i])
 
-     # Combine stats based on timestamp and symbol
-     # This requires a common key. Grouping by window end time works.
-     # We need to aggregate the 'stat_data' structs into a list.
-     # This might need stateful processing or a different approach if unioning streams is problematic.
-
-     # Let's try a different approach: Calculate all stats in one pass using groupBy on timestamp
-     # This doesn't fit well with standard window aggregation.
-     # Reverting to the idea of processing each window and trying to combine.
-
-     # Simplification: Output separate streams or format differently if combining proves too complex.
-     # Let's try the union approach again, focusing on the schema. Spark should handle unioning streaming DFs.
-
-     # **Revised Combination Strategy:**
-     # Perform calculations for each window, add a 'window' column, then union.
-     # Finally group by the *original* timestamp and symbol to collect the stats.
-     # This requires joining the aggregated results back to the original stream or careful state management.
-
-     # **Simplest Viable Streaming Approach:** Output one message per window calculation.
-     # This deviates slightly from the requested single message format per timestamp,
-     # but is much easier to implement reliably in streaming.
-     # Let's follow the *intent* but adjust the *exact* output format slightly if needed.
-     # The spec implies one message per timestamp *containing* all window stats.
-
-     # Try collecting results: Group by window end time and symbol.
-     final_combined_stream = None
-     for i, df in enumerate(stats_dfs):
-         if i == 0:
-             final_combined_stream = df
-         else:
-             # Union requires matching schemas. The schema is (timestamp, symbol, stat_data)
-             final_combined_stream = final_combined_stream.unionByName(df) # Use unionByName if possible (Spark 3.1+)
-
-     # Now group by timestamp and symbol to collect the stat_data structs
-     result_stream = final_combined_stream \
-        .groupBy("timestamp", "symbol") \
-        .agg(F.collect_list("stat_data").alias("stats")) \
-        .select(
-            F.date_format(F.col("timestamp"), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").alias("timestamp_iso"), # ISO8601 format
-            F.col("symbol"),
-            F.col("stats")
-        ) \
-        .select( # Convert final result to JSON string for Kafka
-            F.to_json(
-                F.struct(
-                    F.col("timestamp_iso").alias("timestamp"),
-                    F.col("symbol"),
-                    F.col("stats") # stats is already an array of structs
-                )
-            ).alias("value")
-        )
-
+# --- Group results by window end time and symbol ---
+if final_combined_stream is not None: # Proceed only if union was successful
+    result_stream = final_combined_stream \
+       .groupBy("w_end", "symbol") \
+       .agg(
+           # Use first() to get one start time - assumes all windows ending
+           # at the same time for the same symbol also started at the same
+           # effective time relative to their duration (may need adjustment if using sliding windows)
+           F.first("w_start").alias("window_start_ts"),
+           F.collect_list("stat_data").alias("stats") # Collect the structs
+       ) \
+       .select(
+           # Format timestamps for JSON output
+           F.date_format(F.col("w_end"), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").alias("timestamp"),
+           F.date_format(F.col("window_start_ts"), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").alias("window_start"),
+           F.col("symbol"),
+           F.col("stats") # The collected list of structs
+       ) \
+       .select( # Convert final result to JSON string for Kafka
+           F.to_json(
+               F.struct( # Create the final JSON structure
+                   F.col("timestamp"),
+                   F.col("window_start"),
+                   F.col("symbol"),
+                   F.col("stats")
+               )
+           ).alias("value")
+       )
 else:
-     # Handle case with only one window if necessary (unlikely based on reqs)
-     result_stream = agg_streams[0].select(F.to_json(F.struct(F.col("*"))).alias("value")) # Adjust structure
+    # Handle case where no windows were processed (e.g., no input data)
+    # You might want to log a warning or create an empty stream schema
+    print("WARN: No dataframes to combine, result_stream will be empty or undefined.")
+    # To avoid errors later, define an empty stream with the expected schema
+    output_schema = StructType([StructField("value", StringType(), True)])
+    result_stream = spark.createDataFrame(spark.sparkContext.emptyRDD(), output_schema)
 
 
 # --- Write to Kafka ---
-query = result_stream \
-    .writeStream \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", KAFKA_BROKERS) \
-    .option("topic", OUTPUT_KAFKA_TOPIC) \
-    .outputMode("update") \
-    .option("checkpointLocation", checkpoint_dir) \
-    .start()
+# Check if result_stream is defined before writing
+if result_stream is not None:
+    query = result_stream \
+        .writeStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", KAFKA_BROKERS) \
+        .option("topic", OUTPUT_KAFKA_TOPIC) \
+        .outputMode("update") \
+        .option("checkpointLocation", checkpoint_dir) \
+        .start()
 
-print(f"Streaming moving stats to Kafka topic: {OUTPUT_KAFKA_TOPIC}")
-query.awaitTermination()
+    print(f"Streaming moving stats to Kafka topic: {OUTPUT_KAFKA_TOPIC}")
+    query.awaitTermination()
+else:
+    print("ERROR: result_stream was not created. Stopping.")
 
 # Clean up Spark Session
 spark.stop()

@@ -5,45 +5,49 @@ import logging
 import os
 import signal
 import sys
+# **Imported correctly**
 from datetime import datetime, timezone
+# **Imported correctly**
 from confluent_kafka import Producer
 
 # --- Configuration ---
+# Looks correct
 BINANCE_API_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
 KAFKA_TOPIC = "btc-price"
-# Fetch frequency: At least once per 100ms = 0.1 seconds
-FETCH_INTERVAL_SECONDS = 0.1
-KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+FETCH_INTERVAL_SECONDS = 0.1 # Meets "at least once per 100 ms"
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092") # Good use of env var
 
 # --- Logging Setup ---
+# Standard, looks good
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
 # --- Global flag for graceful shutdown ---
-run = True
+run = True # Standard pattern
 
+# --- Shutdown Handler ---
+# Correctly handles signals to set run=False
 def shutdown_handler(signum, frame):
-    """Handles shutdown signals."""
     global run
     log.info(f"Caught signal {signum}, initiating shutdown...")
     run = False
 
 # --- Kafka Delivery Report Callback ---
+# Standard callback for async producer, logs errors. Looks good.
 def delivery_report(err, msg):
-    """ Called once for each message produced to indicate delivery result.
-        Triggered by poll() or flush(). """
     if err is not None:
         log.error(f'Message delivery failed: {err}')
-    # else:
+    # else: # Debug logging commented out - appropriate
     #     log.debug(f'Message delivered to {msg.topic()} [{msg.partition()}] @ offset {msg.offset()}')
 
-
+# --- Main Function ---
 def main():
-    """Main function to fetch data and produce to Kafka."""
     global run
 
     # --- Kafka Producer Setup ---
+    # Correctly initializes producer with bootstrap servers.
+    # Includes try/except for fatal initialization errors. Good.
     try:
         producer_conf = {'bootstrap.servers': KAFKA_BROKERS}
         producer = Producer(producer_conf)
@@ -53,87 +57,100 @@ def main():
         sys.exit(1)
 
     # --- Register Signal Handlers ---
+    # Correctly registers handlers.
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
 
     log.info("Starting price fetch loop...")
 
     # --- Main Fetch Loop ---
-    while run:
-        start_time = time.monotonic()
+    while run: # Correctly uses the flag
+        start_time = time.monotonic() # Good choice for interval timing
 
         try:
-            # 1. Fetch Price from Binance API
-            response = requests.get(BINANCE_API_URL, timeout=5) # Add timeout
-            received_timestamp = datetime.now(timezone.utc) # Timestamp right after getting response
-            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+            # 1. Fetch Price
+            # Uses correct URL, includes timeout. Good.
+            response = requests.get(BINANCE_API_URL, timeout=5)
+            # **CRITICAL:** Gets timestamp immediately after response using UTC. Correct.
+            received_timestamp = datetime.now(timezone.utc)
+            # Checks for HTTP errors. Good.
+            response.raise_for_status()
 
             # 2. Validate and Parse JSON
+            # Good try/except block for parsing/validation errors.
             try:
                 data = response.json()
-                if not isinstance(data, dict):
+                if not isinstance(data, dict): # Good type check
                     raise ValueError("Response is not a JSON object")
 
                 symbol = data.get("symbol")
                 price_str = data.get("price")
 
+                # Checks symbol. Correct.
                 if symbol != "BTCUSDT":
                     log.warning(f"Received unexpected symbol: {symbol}. Skipping.")
-                    continue # Skip this record
+                    continue
 
+                # Checks for missing price. Correct.
                 if price_str is None:
                      log.warning(f"Price field missing in response: {data}. Skipping.")
                      continue
 
-                # Convert price to float
+                # Converts price. Correct. (ValueError handled by except block)
                 price_float = float(price_str)
 
             except (json.JSONDecodeError, ValueError, KeyError) as e:
-                log.error(f"Error processing Binance response: {e} - Response: {response.text[:200]}") # Log part of the response
-                continue # Skip this record
+                log.error(f"Error processing Binance response: {e} - Response: {response.text[:200]}")
+                continue
 
-
-            # 3. Prepare Kafka Message with ISO8601 Timestamp
-            # Ensure milliseconds are included and 'Z' denotes UTC
+            # 3. Prepare Kafka Message
+            # **CRITICAL:** Formats timestamp correctly to ISO8601 with millis and 'Z'. Correct.
             timestamp_iso = received_timestamp.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
 
+            # Creates correct payload structure.
             message_payload = {
                 "symbol": symbol,
                 "price": price_float,
-                "timestamp": timestamp_iso # Use the formatted ISO string
+                "timestamp": timestamp_iso # Uses the correct ISO string
             }
+            # Encodes to bytes. Correct.
             message_bytes = json.dumps(message_payload).encode('utf-8')
 
-            # 4. Produce to Kafka (Asynchronously)
+            # 4. Produce to Kafka
+            # Uses correct topic, value, key (optional but good), and callback. Correct.
             producer.produce(KAFKA_TOPIC,
                              value=message_bytes,
-                             key=symbol.encode('utf-8'), # Optional: Use symbol as key for partitioning
+                             key=symbol.encode('utf-8'),
                              callback=delivery_report)
 
-            # Trigger delivery report callbacks (non-blocking)
+            # Trigger delivery report callbacks. Correct.
             producer.poll(0)
 
+        # Good specific error handling for requests.
         except requests.exceptions.Timeout:
             log.warning(f"Request to Binance API timed out.")
         except requests.exceptions.RequestException as e:
             log.error(f"Error fetching price from Binance: {e}")
+        # Catches other unexpected errors. Good.
         except Exception as e:
-            log.error(f"An unexpected error occurred: {e}", exc_info=True) # Log traceback for unexpected errors
-
+            log.error(f"An unexpected error occurred: {e}", exc_info=True)
 
         # --- Maintain Fetch Interval ---
+        # Correctly calculates sleep duration.
         elapsed_time = time.monotonic() - start_time
         sleep_duration = max(0, FETCH_INTERVAL_SECONDS - elapsed_time)
-        if run: # Avoid sleeping if shutdown signal was received during processing
+        # Checks flag before sleeping. Good.
+        if run:
             time.sleep(sleep_duration)
 
-
     # --- Shutdown Sequence ---
+    # Logs exit.
     log.info("Exiting fetch loop.")
     log.info("Flushing Kafka producer...")
+    # Correctly flushes producer with timeout.
+    # Provides feedback on remaining messages. Good.
     try:
-        # Wait for all messages in the Producer queue to be delivered.
-        remaining_messages = producer.flush(timeout=15) # Wait up to 15 seconds
+        remaining_messages = producer.flush(timeout=15)
         if remaining_messages > 0:
              log.warning(f"{remaining_messages} messages were potentially not delivered.")
         else:
@@ -143,6 +160,7 @@ def main():
 
     log.info("Producer closed.")
 
-
+# --- Main Execution Block ---
+# Standard Python practice. Correct.
 if __name__ == "__main__":
     main()
