@@ -11,6 +11,7 @@ spark = get_spark_session(APP_NAME, mongo_connection_string=MONGO_URI) # Pass Mo
 # --- Constants ---
 INPUT_KAFKA_TOPIC = "btc-price-zscore"
 MONGO_DB_NAME = MONGO_URI.split("/")[-1].split("?")[0] # Extract DB name from URI
+LATE_DATA_THRESHOLD_ZSCORE = "10 seconds"
 
 # --- Schema ---
 zscore_info_schema = StructType([
@@ -31,14 +32,15 @@ raw_stream = spark \
     .option("kafka.bootstrap.servers", KAFKA_BROKERS) \
     .option("subscribe", INPUT_KAFKA_TOPIC) \
     .option("startingOffsets", "latest") \
+    .option("failOnDataLoss", "false") \
     .load()
 
 # --- Parse JSON Data ---
 json_stream = raw_stream \
     .select(F.from_json(F.col("value").cast("string"), zscore_schema).alias("data")) \
     .select("data.*") \
-    .withColumn("event_timestamp", F.to_timestamp(F.col("timestamp"), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")) # Convert back to timestamp if needed
-
+    .withColumn("event_timestamp", F.to_timestamp(F.col("timestamp"), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")) \
+    .withWatermark("event_timestamp", LATE_DATA_THRESHOLD_ZSCORE)
 
 # --- Prepare for MongoDB Write (using foreachBatch) ---
 def write_to_mongo(batch_df, batch_id):
