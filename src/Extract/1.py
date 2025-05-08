@@ -18,7 +18,6 @@ FETCH_INTERVAL_SECONDS = 0.1 # Meets "at least once per 100 ms"
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092") # Good use of env var
 
 # --- Logging Setup ---
-# Standard, looks good
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
@@ -69,34 +68,33 @@ def main():
 
         try:
             # 1. Fetch Price
-            # Uses correct URL, includes timeout. Good.
+            # Uses correct URL, includes timeout
             response = requests.get(BINANCE_API_URL, timeout=5)
-            # **CRITICAL:** Gets timestamp immediately after response using UTC. Correct.
+            # **CRITICAL:** Gets timestamp immediately after response using UTC.
             received_timestamp = datetime.now(timezone.utc)
-            # Checks for HTTP errors. Good.
+            # Checks for HTTP errors. 
             response.raise_for_status()
 
             # 2. Validate and Parse JSON
-            # Good try/except block for parsing/validation errors.
             try:
                 data = response.json()
-                if not isinstance(data, dict): # Good type check
+                if not isinstance(data, dict): 
                     raise ValueError("Response is not a JSON object")
 
                 symbol = data.get("symbol")
                 price_str = data.get("price")
 
-                # Checks symbol. Correct.
+                # Checks symbol
                 if symbol != "BTCUSDT":
                     log.warning(f"Received unexpected symbol: {symbol}. Skipping.")
                     continue
 
-                # Checks for missing price. Correct.
+                # Checks for missing price
                 if price_str is None:
                      log.warning(f"Price field missing in response: {data}. Skipping.")
                      continue
 
-                # Converts price. Correct. (ValueError handled by except block)
+                # Converts price. (ValueError handled by except block)
                 price_float = float(price_str)
 
             except (json.JSONDecodeError, ValueError, KeyError) as e:
@@ -104,7 +102,7 @@ def main():
                 continue
 
             # 3. Prepare Kafka Message
-            # **CRITICAL:** Formats timestamp correctly to ISO8601 with millis and 'Z'. Correct.
+           #Formats timestamp correctly to ISO8601 with millis and 'Z'
             timestamp_iso = received_timestamp.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
 
             # Creates correct payload structure.
@@ -113,11 +111,10 @@ def main():
                 "price": price_float,
                 "timestamp": timestamp_iso # Uses the correct ISO string
             }
-            # Encodes to bytes. Correct.
+            # Encodes to bytes.
             message_bytes = json.dumps(message_payload).encode('utf-8')
 
             # 4. Produce to Kafka
-            # Uses correct topic, value, key (optional but good), and callback. Correct.
             producer.produce(KAFKA_TOPIC,
                              value=message_bytes,
                              key=symbol.encode('utf-8'),
@@ -126,20 +123,16 @@ def main():
             # Trigger delivery report callbacks. Correct.
             producer.poll(0)
 
-        # Good specific error handling for requests.
         except requests.exceptions.Timeout:
             log.warning(f"Request to Binance API timed out.")
         except requests.exceptions.RequestException as e:
             log.error(f"Error fetching price from Binance: {e}")
-        # Catches other unexpected errors. Good.
         except Exception as e:
             log.error(f"An unexpected error occurred: {e}", exc_info=True)
 
         # --- Maintain Fetch Interval ---
-        # Correctly calculates sleep duration.
         elapsed_time = time.monotonic() - start_time
         sleep_duration = max(0, FETCH_INTERVAL_SECONDS - elapsed_time)
-        # Checks flag before sleeping. Good.
         if run:
             time.sleep(sleep_duration)
 
